@@ -1,0 +1,69 @@
+{
+  "id": "10042",
+  "key": "ABC-12",
+  "self": "https://example.atlassian.net/rest/api/3/issue/10042",
+  "fields": {
+    "summary": "Naprawić timeout w module B",
+    "status": { "id": "3", "name": "In Progress", "statusCategory": { "key": "indeterminate" } },
+    "issuetype": { "id": "10001", "name": "Task", "subtask": false },
+    "priority": { "name": "High" },
+    "assignee": { "accountId": "557058:aaa", "displayName": "Jan Kowalski", "emailAddress": null },
+    "reporter": { "accountId": "557058:bbb", "displayName": "Anna Nowak" },
+    "labels": ["backend", "hotfix"],
+    "created": "2026-10-01T08:00:00.000+0200",
+    "updated": "2026-10-16T09:12:33.123+0200",
+    "customfield_10016": 3,
+    "parent": {
+      "key": "ABC-1",
+      "fields": {
+        "summary": "Epik: stabilność",
+        "status": { "id": "1", "name": "To Do", "statusCategory": { "key": "new" } },
+        "issuetype": { "id": "10000", "name": "Epic", "subtask": false }
+      }
+    },
+    "subtasks": [
+      {
+        "key": "ABC-13",
+        "fields": {
+          "summary": "Test regresji",
+          "status": { "id": "10002", "name": "Done", "statusCategory": { "key": "done" } },
+          "issuetype": { "id": "10003", "name": "Sub-task", "subtask": true }
+        }
+      }
+    ],
+    "description": {
+      "type": "doc",
+      "version": 1,
+      "content": [
+        { "type": "paragraph", "content": [
+          { "type": "text", "text": "Moduł zgłasza " },
+          { "type": "text", "text": "timeout", "marks": [{ "type": "code" }] },
+          { "type": "text", "text": " po " },
+          { "type": "text", "text": "30 s", "marks": [{ "type": "strong" }] },
+          { "type": "text", "text": "." }
+        ] },
+        { "type": "heading", "attrs": { "level": 2 }, "content": [{ "type": "text", "text": "Kroki" }] },
+        { "type": "orderedList", "attrs": { "order": 1 }, "content": [
+          { "type": "listItem", "content": [{ "type": "paragraph", "content": [{ "type": "text", "text": "uruchom moduł" }] }] },
+          { "type": "listItem", "content": [
+            { "type": "paragraph", "content": [{ "type": "text", "text": "odczekaj" }] },
+            { "type": "bulletList", "content": [
+              { "type": "listItem", "content": [{ "type": "paragraph", "content": [
+                { "type": "text", "text": "zobacz " },
+                { "type": "text", "text": "log", "marks": [{ "type": "link", "attrs": { "href": "https://example.com/log" } }] }
+              ] }] }
+            ] }
+          ] }
+        ] },
+        { "type": "taskList", "attrs": { "localId": "t1" }, "content": [
+          { "type": "taskItem", "attrs": { "localId": "i1", "state": "DONE" }, "content": [{ "type": "text", "text": "analiza" }] },
+          { "type": "taskItem", "attrs": { "localId": "i2", "state": "TODO" }, "content": [
+            { "type": "text", "text": "fix dla " },
+            { "type": "mention", "attrs": { "id": "557058:aaa", "text": "@Jan Kowalski" } }
+          ] }
+        ] },
+        { "type": "codeBlock", "attrs": { "language": "c" }, "content": [{ "type": "text", "text": "if (t > 30) {\n  reset();\n}" }] }
+      ]
+    }
+  }
+}
