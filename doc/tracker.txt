@@ -1,0 +1,1010 @@
+*tracker.txt*	Issue tracker client for Neovim -- Jira Cloud first
+
+Author:   Damian Stefaniuk (D3xter87)
+License:  MIT
+
+==============================================================================
+CONTENTS                                                    *tracker-contents*
+
+  1. Introduction ..................................... |tracker-intro|
+  2. Requirements ..................................... |tracker-requirements|
+  3. Installation ..................................... |tracker-installation|
+  4. Authentication ................................... |tracker-auth|
+  5. Configuration .................................... |tracker-config|
+  6. Views and keys ................................... |tracker-views|
+  7. Markdown and Jira text ........................... |tracker-markdown|
+  8. Lua API .......................................... |tracker-api|
+  9. Events ........................................... |tracker-events|
+ 10. Status line ...................................... |tracker-status|
+ 11. Providers ........................................ |tracker-providers|
+ 12. Notifications .................................... |tracker-notify|
+ 13. Troubleshooting .................................. |tracker-trouble|
+
+==============================================================================
+1. Introduction                                                *tracker-intro*
+
+`tracker.nvim` works with an issue tracker from inside Neovim: your issues
+and saved JQL searches, a single issue with its comments, the active sprint
+board, and the everyday actions -- status transitions, assignee, comments,
+editing, creating issues and sub-tasks.
+
+Design rules:
+
+  - The plugin is code only. It defines no commands, no keymaps and holds no
+    site data; base URL, project, queries, commands and keys live in your
+    config, tokens in netrc / env (|tracker-config|, |tracker-auth|).
+  - Trackers are providers behind one interface (|tracker-providers|). Jira
+    Cloud (REST v3 + Agile 1.0) ships first.
+  - Everything the UI does goes through the public Lua API (|tracker-api|),
+    and every change emits a `User` event (|tracker-events|), so other
+    plugins and scripts integrate without depending on the UI.
+
+Only the system `curl` binary is used for HTTP (no plenary, no CLI tools).
+
+==============================================================================
+2. Requirements                                         *tracker-requirements*
+
+  - Neovim 0.10+ (`vim.system`, `vim.base64`).
+  - `curl` on PATH.
+  - Jira Cloud: an Atlassian API token
+    (https://id.atlassian.com/manage-profile/security/api-tokens).
+  - Optional: the treesitter `markdown` / `markdown_inline` parsers for
+    highlighting the issue view and editors.
+
+==============================================================================
+3. Installation                                         *tracker-installation*
+
+With `lazy.nvim`: >lua
+
+    {
+      "D3xter87/tracker.nvim",
+      cmd = { "Tracker" },            -- whatever commands YOU define
+      opts = {
+        providers = {
+          jira = {
+            base_url = "https://<site>.atlassian.net",
+            project = "ABC",
+          },
+        },
+      },
+      config = function(_, opts)
+        require("tracker").setup(opts)
+        vim.api.nvim_create_user_command("Tracker", function(a)
+          require("tracker").open(a.args)
+        end, { nargs = "?", complete = function(lead)
+          return require("tracker").complete(lead, "keys")
+        end })
+      end,
+    }
+<
+Entry points for your commands / keymaps (all in `require("tracker")`):
+
+  open([key])        issue `key`; without it the current branch's issue on
+                     top of the `ui.issue_base` view: its board (default) or
+                     the default query; back goes there, cursor on the
+                     issue's card / row (just the issue when there is no
+                     board id or no saved query). The first saved query when
+                     the branch has no key
+  issue(key)         issue view
+  search([query])    list view; `query` = saved query name or raw JQL;
+                     nil = first saved query
+  pick_query()       choose a saved query (or type JQL), then list it
+  board([opts])      sprint / kanban board; opts = { board_id?, project? }
+  sprints([opts])    the board's sprints: new / edit / start / complete;
+                     opts = { board_id? }
+  timeline([opts])   epics as bars over time; opts = { project? }
+  create([opts])     new issue; opts = { project?, parent? } (parent makes
+                     a sub-task)
+  web([key])         open in the browser (default: the branch's issue)
+  complete(lead, what)
+                     command-line completion: saved query names ("queries"),
+                     branch + recently seen keys ("keys"), or both (nil)
+
+Check the setup with `:checkhealth tracker` -- it authenticates against the
+server and reports who you are.
+
+==============================================================================
+4. Authentication                                               *tracker-auth*
+
+Token lookup, first hit wins:
+
+  1. `providers.<name>.token` in setup() (avoid; configs get committed)
+  2. netrc (`~/.netrc`, `%USERPROFILE%\_netrc` on Windows): the `password`
+     of the machine named by `providers.<name>.netrc_machine`, else of the
+     `base_url` host
+  3. `$TRACKER_<NAME>_TOKEN`, e.g. `$TRACKER_JIRA_TOKEN`
+
+The login (Jira Cloud: your Atlassian account e-mail) comes from
+`providers.<name>.login`, then the netrc entry's `login`, then
+`$TRACKER_<NAME>_LOGIN`. Jira Cloud uses HTTP Basic with e-mail + API token;
+set `auth = "bearer"` for a personal access token (Server / Data Center
+style).
+
+netrc example: >
+
+    machine mysite.atlassian.net
+      login jan.kowalski@example.com
+      password <API token>
+<
+Tokens are never logged, cached or written anywhere by the plugin.
+
+==============================================================================
+5. Configuration                                              *tracker-config*
+
+Defaults (everything optional except a provider's `base_url`): >lua
+
+    require("tracker").setup({
+      default_provider = nil,      -- nil = first configured provider
+      providers = {
+        jira = {
+          base_url = nil,          -- "https://<site>.atlassian.net"
+          login = nil,             -- e-mail; default: netrc login
+          token = nil,             -- default: netrc password / env
+          netrc_machine = nil,     -- default: the base_url host
+          auth = "basic",          -- "basic" | "bearer"
+          project = nil,           -- default project: {project}, create, board
+          projects = nil,          -- keys accepted in branch names, e.g.
+                                   -- { "ABC", "OPS" }; nil = any key
+          board = nil,             -- board id; nil = pick from the project
+          default_query = nil,     -- saved query name or JQL for the default
+                                   -- list; nil = the first of `queries`
+          boards = nil,            -- several boards, see |tracker-boards|
+          repos = nil,             -- git repository → its boards
+          fields = {               -- nil = detected (see below)
+            story_points = nil,    -- e.g. "customfield_10016"
+            epic_color = nil,      -- e.g. "customfield_10013"
+            start_date = nil,      -- timeline "Start date", e.g. "customfield_10015"
+            sprint = nil,          -- "Sprint", e.g. "customfield_10020"
+          },
+          queries = {              -- first one = default list
+            -- children = true: also every child of a listed issue (sub-tasks
+            -- of your stories, issues of your epics), whoever is assigned
+            { name = "mine", jql = "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC", children = true },
+            { name = "sprint", sprint = true },   -- active sprint of `board`
+            { name = "backlog", backlog = true }, -- the backlog of `board`
+          },
+        },
+      },
+      issue_key_pattern = "%u[%u%d]+%-%d+", -- Lua pattern, on the upper-cased branch
+      limit = 200,                 -- max issues per list (paged)
+      ui = {
+        layout = "float",          -- where views open: "float"; "split" /
+                                   -- "vsplit" next to the current window
+                                   -- ('splitbelow' / 'splitright' pick the
+                                   -- side); "tab" a new tab page. Outside a
+                                   -- float the title is in the winbar and the
+                                   -- key hints in the statusline
+        issue_base = "board",      -- the view under the branch's issue on
+                                   -- open() without a key (back lands on
+                                   -- its card / row): "board" its board,
+                                   -- "search" the default query, false none
+        width = 0.85, height = 0.8, border = "rounded", -- the float
+        redraw = "auto",           -- after a view scrolled (j / k, <C-d>, the
+                                   -- wheel): "window" draws the whole window
+                                   -- afresh (no doubled / missing rows under
+                                   -- wrapped text, conceal or images);
+                                   -- "full" also clears the screen
+                                   -- (:redraw!) where the terminal loses
+                                   -- cells while rows move — tmux on Windows
+                                   -- drops single characters from the middle
+                                   -- of lines; "auto" = "full" inside tmux
+                                   -- on Windows, "window" elsewhere; false:
+                                   -- left to Neovim
+        board_min_column = 22,     -- board column width floor
+        list_width = "fit",        -- lists: the summary column as wide as the
+                                   -- longest summary (+ labels), right-hand
+                                   -- columns right after it; "fill" = to the
+                                   -- window edge
+        file_chooser = nil,        -- { cmd…, "{file}" }: writes chosen paths to {file},
+                                   -- one per line; nil = yazi --chooser-file, else a
+                                   -- path prompt
+        paste_image = nil,         -- { cmd…, "{path}" }: clipboard image → PNG at
+                                   -- {path} (also $TRACKER_PASTE_PATH), exit ≠ 0
+                                   -- when there is none; nil = built in: PowerShell
+                                   -- (Windows), wl-paste / xclip (Linux), pngpaste
+        status_icons = true,       -- false: strip leading emoji from status /
+                                   -- column names (ZWJ emoji such as 👨🏻‍💻
+                                   -- have no agreed width; columns drift)
+        images = "auto",           -- inline images via snacks.nvim, see
+                                   -- |tracker-images|; true / false
+        image_max_height = 20,     -- rows per image
+        expand_subtasks = true,    -- lists start with sub-tasks unfolded
+        icons = {
+          -- types = { ["zadanie"] = { "\u{f14a}", "TrackerType_task" } },
+          -- epic_colors = { 14 hex colours for ghx-label-1..14 },
+        },
+      },
+      git = {                      -- gb gr gc gv, see |tracker-git|
+        repos = nil,               -- per repository: any of these, on top
+        remote = "origin",
+        fetch = { "git", "fetch", "--prune", "{remote}" },  -- false = none
+        branch = "{key_lower}",    -- {key} {key_lower} {slug} {type}
+        checkout = { "git", "switch", "{branch}" },  -- an existing branch
+        pull = { "git", "pull" },  -- then, when on the remote; false = none
+        create = { "git", "switch", "-c", "{branch}" },  -- a new one
+        env = nil,                 -- extra environment for `create`
+        milestone = nil,           -- string / function(issue) for {milestone}
+        assign_me = true,          -- unassigned → you, once it worked
+        transition = nil,          -- status name(s) for a still-to-do issue
+        mr_link = true,            -- MR URL in the output → a web link
+        review = <review.nvim>,    -- `gr`: function(branch, issue); false
+        cicd = <cicd.nvim>,        -- `gc`: function(branch, issue); false
+        web_url = nil,             -- the remote's web address; nil = its URL
+        commit_url = <GitLab / GitHub>, -- "{web_url}/…/{hash}" / function
+        verify = {                 -- `gv`, see |tracker-verify|
+          merge = nil,             -- { cmd…, "{branch}" }; nil = off
+          env = nil, terminal = false,
+          transition = nil,        -- status name(s), the first offered
+          unassign = true,
+          template = "…",          -- the comment draft; function / false
+          epic = { branch = nil, transition = nil, template = "…" },
+        },
+      },
+      notify = { enabled = true, actions = true, errors = true },
+      status = { ttl = 300000 },   -- |tracker-status| freshness (ms)
+      debug = false,               -- log every request (method + URL) at DEBUG
+    })
+<
+A user list (`queries`, `projects`) replaces the default list; it is not
+merged item by item. `{project}` in a query expands to `project`; a query
+using it is hidden while `project` is unset. `sprint = true` / `backlog =
+true` entries list the active sprint / backlog of `board` exactly as Jira's
+board shows them -- the same issues (the board's filter applies) in the same
+order (rank, as you drag them in Jira). JQL can't reproduce that: e.g.
+`sprint in openSprints()` also returns sprint issues the board filters out.
+Both are hidden while `board` is unset.
+
+                                                            *tracker-sections*
+Queries over several boards, and queries made of other queries: >lua
+
+    queries = {
+      { name = "all", sections = { "mine", "sprints", "backlogs" } },
+      { name = "mine", jql = "assignee = currentUser() AND statusCategory != Done" },
+      { name = "sprints", sprints = true },   -- every active sprint
+      { name = "backlogs", backlogs = true }, -- every backlog
+    },
+<
+`sprints = true` lists the active sprints of every board of the repository
+(|tracker-boards|; outside one: of `board`), one section per sprint
+("CVNT · Sprint 42"); `backlogs = true` the backlog of each, one section per
+board. `sections` lists the named saved queries one after another, each part
+(a sprints / backlogs query: each of its sections) under its own header with
+its issue count and points, drawn as a band across the window
+(`TrackerSection`, default `Folded`; the name in `TrackerSectionTitle`).
+`]]` / `[[` jump between headers; they fold like `F` groups (<Tab>, zR / zM);
+`F` grouping replaces them while it is on. An issue in two sections shows in
+both. Unknown names in `sections` are skipped.
+
+                                                              *tracker-boards*
+Several boards: `boards` names them, `repos` says which ones a git
+repository uses, its main board first: >lua
+
+    boards = {
+      CVNT = { board = 142 },                  -- project = the name
+      EP = { project = "EP", board = 147,
+             queries = { ... },                -- replace `queries` there
+             default_query = "mine" },
+      OPS = { tags = { "OPS", "INFRA" } },     -- key prefixes in branch names
+    },                                         -- (default: { project })
+    repos = {
+      panel = { "CVNT", "EP" },                -- directory name of the repo
+      ["~/work/api"] = { "EP", default_query = "project = EP" }, -- or path
+    },
+<
+In `panel` the branch `cvnt-4598` opens CVNT-4598 and `ep-4325` EP-4325; a
+branch without a key of its boards opens the default query (`default_query`
+of the repos entry, else of the main board, else of the provider, else the
+first saved query). Only the branch decides which issue opens: the board,
+sprints, backlog, timeline, new issues and `{project}` in queries use the
+repository's main board. The board view offers a pick when the repository
+has several boards with an id; the queries of other boards that have
+`queries` of their own are listed (and completed) as `EP/sprint`, and
+`sprints` / `backlogs` (|tracker-sections|) cover all of them. A repository missing from `repos` accepts the
+keys of every board and keeps the provider's own `project` / `board` /
+`queries`. `projects` is ignored once `boards` is set.
+
+Custom fields are detected once a day: story points = the board's
+estimation field when `board` is set (what Jira's board sums), else a field
+named "Story Points" / "Story point estimate"; epic colour = the field of
+type "Epic Color" (team-managed sites fall back to the Agile epic API).
+Set `fields.*` to override. Ids are listed by `GET /rest/api/3/field` --
+open `<base_url>/rest/api/3/field` in a browser where you are logged in.
+
+Epic chips use Jira Cloud's epic palette (ghx-label-1..14, per Atlassian's
+"Use epic color for epics in Jira Cloud"); `ui.icons.epic_colors` replaces
+it.
+
+==============================================================================
+6. Views and keys                                              *tracker-views*
+
+All views share one window with a stack: opening an issue from a list
+pushes it. The window is a float, a split or a tab page (`ui.layout`).
+There is one such window per tab page: a view opened from a tab page that
+has none starts another, independent tracker (with `layout = "tab"`, a
+tracker tab per project tab — it keeps the `:tcd` of the tab it was opened
+from, so it keeps resolving that repository's boards; a reload after an
+action runs there too, wherever you are by then), while a view opened from
+the tracker's own tab page stacks on it. In every view:
+    q <Esc> <BS> <C-o>
+                  back to the previous view (cursor kept); on the first
+                  view (e.g. the list) they close the window
+    h             back, but only when there is a view to go back to (never
+                  closes the window; the board uses h / l for its columns)
+    Q             close the window from any view, also from free mode and
+                  the floats over it (help, preview, pickers, the editor —
+                  its text kept as a draft as on q)
+    ?             the keys of the current view
+Views refresh when you come back to them, and the list and the board
+reload after every action done in them. Jira's search index (behind JQL
+search and the board / backlog endpoints alike) catches up with a change
+only after a moment, so a reload that still shows the old state is
+repeated — after 1, 2, 3 and 5 seconds, with "syncing…" in the title —
+until the changed issue comes back changed (or is gone from the list). If
+it never does, the view says so and `r` reloads by hand. `l` goes the other
+way: it opens the issue under the cursor (list) or the sub-task / key under
+it (issue).
+
+List ~
+Laid out like Jira's backlog. Each row: fold marker, issue type icon, key,
+priority icon, summary with its labels (#tag), the summary column as wide
+as the longest one shown (`ui.list_width = "fill"`: to the window edge),
+then on the right the epic (a chip in the epic's
+Jira colour), story points, assignee and status. A parent with sub-tasks
+shows `closed/own` in the points column: the points of its sub-tasks in a
+Done-category status (finished or rejected) over
+its own (hand-set) estimate, e.g. `3/10`. A sum above the estimate (`14/10`)
+is highlighted (TrackerPointsOver) — the story's points need correcting.
+The sum counts every sub-task the list knows, so a story listed in two
+sections (`mine` and a backlog, which has no closed issues) shows the same
+progress in both.
+Issues nest under their parent when the parent is listed too — epic →
+story / task → sub-task, foldable at every level (sub-tasks keep the
+parent's order); a folded parent
+shows `[+N]`. An issue whose parent isn't in the list is a normal row. A
+saved query with `children = true` (default for `mine`) also fetches the
+missing children of what it lists, whoever they are assigned to.
+Type icons follow the hierarchy level and the (localized) type name —
+"Zadanie", "Podzadanie", "Błąd …", "Weryfikacja", ... — see `ui.icons`.
+    j / k     next / previous issue row (headers and blank lines skipped,
+              a count works: 5j), centred in the window
+    ]] / [[   next / previous section or `F` group header (inside one, [[
+              goes to its own first), at the top of the window
+    <CR> l    open issue         K     preview: description, reporter,
+                                        labels, sub-tasks, files (again K =
+                                        step inside to scroll; moving the
+                                        cursor closes it)
+    <Tab> za  fold / unfold the sub-tasks (on a sub-task: its parent)
+    zo / zc   unfold / fold       zR / zM  unfold / fold all
+    e         edit the summary (title)
+    E         pick a field to edit: summary, description, status,
+              assignee, priority, story points, epic (with "No epic" /
+              "+ New epic…"), labels, reporter
+    S         edit story points
+    L         edit labels (comma separated)
+    A         toggle: assigned to you → unassign, otherwise → assign to you
+    m         mark / unmark the issue (● in the first column); several can
+              be marked. <Esc> clears the / filter, then the f filters,
+              then the marks (without any: back) — so marks made on a
+              filtered list survive clearing the filter
+    p / P     put the marked issues right BELOW / ABOVE the cursor's issue —
+              Jira's rank, as dragging in the backlog does (in their list
+              order; visible in rank-ordered lists: sprint, backlog)
+    M         move the marked issues (or the cursor's): to a sprint (active /
+              future of `board`), to the backlog, under an epic ("No epic",
+              "+ New epic…"), sub-tasks under another parent
+    d         archive the marked / cursor issues — asks first; Jira Cloud
+              allows it on Premium / Enterprise only (else Jira's error)
+    D         DELETE the marked / cursor issues for good — asks first,
+              naming them; an issue's sub-tasks go with it (the question
+              says so). Can't be undone
+    s         change status       a     assign (picker)
+    c         add comment         n     new issue
+    (sign)    a red ban sign before the summary (also on board cards):
+              the issue "is blocked by" an issue that isn't done
+    gb        the cursor's issue's branch: check out and pull an
+              existing one (local or on the remote), else create it
+              (`git.create`, e.g. + merge request) (|tracker-git|)
+    gr gc     `git.review` / `git.cicd` (review.nvim / cicd.nvim) on the
+              issue's branch
+    gv        hand the issue over for verification (|tracker-verify|)
+    U         upload files to the issue (the chooser, as `e` on an
+              issue's Attachments)
+    C         clone the issue: a popup with "CLONE - <summary>" to
+              adjust, <C-s> creates the copy and opens it (see Clone)
+    o gx      open in browser     y / Y copy key / URL
+    f         quick filters, like Jira's: pick a category — Epic, Assignee,
+              Type, Status, Label — then tick values in a multi-select
+              (<Space>/x toggle, a all / none, <CR> ok, q cancel). "No
+              epic" / "Unassigned" / "No labels" are values too. Values
+              of one category are OR-ed, categories AND-ed; a sub-task
+              counts under its parent's epic. Active filters show under
+              the title ("filters: …", `(N of M)`); `f` again offers
+              "Clear filters". "Open a whole epic…" opens a new list with
+              every child of an epic (`parent = KEY`, rank order, with
+              their sub-tasks) — <BS> / q comes back
+    F         group into sections: by epic, assignee or status (or none).
+              Each header shows the epic chip / person / status, the
+              number of issues and `closed/total pts` (story points of
+              Done-category issues over all, sub-tasks not counted twice).
+              <Tab> on a header folds the whole section, j / k stop on
+              headers. Grouping and `f` combine. A sub-task goes to the
+              group of its own assignee / status, so it may leave its
+              parent's tree there
+    /         text filter (key, summary, status, assignee, epic, labels),
+              on top of `f` — the filtered list is flat
+    J         switch query / JQL  r     refresh
+
+Issue ~
+Organised in sections like review.nvim's Info panel: the title, every field
+(status, type, priority, assignee, reporter, labels, story points, epic /
+parent, dates), the description, each sub-task, the links (grouped by
+relation: "blocks", "is blocked by", "clones", … each linked issue with its
+status; <CR> opens it), each comment and each attachment.
+    j / k     next / previous section (inside a tall section `k` first
+              returns to its start), centred in the window (zz) so its
+              content is in view; <Down> / <Up>, <C-d> / <C-u> still move
+              line by line, e.g. through a long description
+    e         edit the section under the cursor:
+                title         summary (single line)
+                Status        transition picker
+                Priority      picker (with icons)
+                Assignee      picker (Reporter: same list)
+                Labels        comma separated input
+                Story points  number (`,` or `.`; empty clears)
+                Epic          open epics of the project, "No epic" or
+                              "+ New epic…" (created, then linked)
+                Description   Markdown popup
+                a sub-task    its summary
+                Sub-tasks     new sub-task
+                Links / a link
+                              add a link: the relation (both directions
+                              of every link type: "blocks", "is blocked
+                              by", "clones", …), then the issue — one seen
+                              this session, or "Search…": a key, or text
+                              searched in the project
+                a comment     edit it (yours only)
+                Comments      new comment
+                an attachment open it
+                Attachments   upload files: yazi opens in a float
+                              (<Space> selects several, <CR> uploads, q
+                              cancels); see `ui.file_chooser`
+              Type, a sub-task's Parent and the dates are read-only.
+    E         pick a field to edit (menu)
+    V         copy the section's content to the clipboard (" and +) and
+              stay in section mode: a comment's / the description's
+              Markdown, a field's value, the summary — no headers or labels
+    v         free mode: the view's keys step aside, so plain motions
+              (j / k by line, w, /, …), selecting (v / V) and yanking (y)
+              work anywhere; the footer reads FREE. <Esc> or q goes back to
+              section mode
+    s a A c   as in the list (A toggles you as assignee)
+    R         reply to the comment under cursor
+    D         on a comment: delete it — yours only; asks first, naming
+              its date and first words. On a link: remove the link (asks).
+              On an attachment: delete the file from the issue (asks).
+              Anywhere else: delete the issue
+    C         clone this issue (as in the list)
+    S         create sub-task     gp    open parent / epic
+    gb gr gc gv  branch, review, pipelines, hand over: |tracker-git|
+    M d D     move / archive / delete this issue (as in the list; after
+              archive or delete the view goes back to the list)
+
+Clone ~
+`C` (list or issue) copies the issue as Jira's Clone does: same type,
+description (as stored — panels, tables, mentions and images come over
+unchanged), priority, labels, story points, Start / Due date, epic or
+parent and reporter; the summary is what you leave in the popup ("CLONE -
+…" by default). Every sub-task is cloned under the copy (own summaries),
+and the copy gets a "clones" link to the original. Assignee, sprint,
+status, comments and attachments start fresh. A field Jira refuses on its
+create screen is left out and named in a warning.
+    <CR>      on an attachment (the Attachments list or an
+              `[attachment: …](adf:N)` line): download once, open with the
+              system viewer; elsewhere: open the issue key under the cursor
+    gx        the same for an attachment line (also in free mode `v`, the
+              editor popup — an `(upload:…)` line opens that file — and
+              the `K` preview); a URL under the cursor; else the issue in
+              the browser (`o` always opens the issue)
+    o y Y r   as in the list
+
+                                                              *tracker-images*
+With snacks.nvim installed (its `image` module) and a terminal that speaks
+the Kitty graphics protocol (kitty, Ghostty, WezTerm, ...), images in the
+description and comments are drawn under their `[attachment: …]` lines.
+`ui.images = "auto"` (default) decides from snacks' terminal detection,
+`true` skips that check, `false` turns images off. Files are downloaded
+once into stdpath("cache")/tracker/ and reused. Photos that keep their
+rotation in EXIF (phone JPEGs) are drawn from an upright copy made with
+ImageMagick's `magick -auto-orient`, as Jira shows them. Without snacks the
+lines stay text and <CR> still opens the file.
+
+Board ~
+Columns come from the board's own configuration; empty ones are narrowed
+(still a target for `>`), and statuses no column maps land in "Other".
+    <CR>      open issue          h / l previous / next column
+    < / >     move the card one column left / right (first transition
+              into that column's statuses)
+    s a A c   as in the list (A toggles you)   m  toggle "only my issues"
+    B         backlog list        S     sprints (below)
+    o y r     as in the list
+
+Sprints ~
+`require("tracker").sprints({ board_id? })` (config: `:TrackerSprints`) or
+`S` on the board. The board's sprints in three foldable sections: Active
+and Future (each with its dates, days left / length and the whole goal)
+and Closed (newest first, folded; the goal's first line).
+    j / k     next / previous sprint or section header (centred)
+    <CR> l    the sprint's issues as a list (board rank order)
+    K         details: dates with times, the whole goal
+    <Tab> za  fold / unfold the section
+    n         new sprint — the form comes pre-filled like Jira does: the
+              newest sprint's number + 1 ("#60 Name" → "#61"), starting
+              where the last open sprint ends, for the board's usual
+              length (the newest sprint's, in weeks)
+    e         edit name / dates / goal (active and future sprints)
+    s         start a future sprint: from now, for its planned length
+    C         complete the active sprint: asks "Complete #60? 5 done,
+              3 open → #61". Done = the board's LAST column, as Jira
+              counts it. Open issues (their sub-tasks follow) move to the
+              first future sprint; when there is none, a new one is
+              created (the next number, no dates) and gets them. Then
+              the sprint closes
+    y         copy the name       r     refresh
+
+The sprint form is an editor popup (same keys) holding: >
+    Name:     #61
+    Start:    2026-11-02 13:00
+    Duration: 3w
+    End:      2026-11-23 13:00
+    Goal:
+    1. every line from here on is the goal
+<
+Dates are local time, `YYYY-MM-DD HH:MM` (or just the date). End follows
+Start + Duration as you type (`1w` … `4w`, `10d`); typing an End yourself
+sets Duration to its length, or `custom` when the time of day differs. An
+empty Start saves a future sprint without dates; starting needs both.
+
+Timeline ~
+`require("tracker").timeline({ project? })` (config: `:TrackerTimeline`).
+Like Jira's Timeline: one row per epic of the project (open ones, rank
+order) with a bar from its Start date to its Due date; <Tab> unfolds the
+epic's issues, each with its own bar. A month line and a tick line (day
+numbers / Mondays) on top, today marked ▼ and as a │ down the chart.
+
+Where a date is missing the bar comes from the sprint the issue is in (its
+newest sprint with dates); an epic without dates spans its issues. Such a
+bar is drawn in TrackerBarDerived (dim) — the sprint decides, not a date.
+No dates and no sprint: "no dates". `◀` / `▶` mark bars running off the
+chart. Epic bars fill by progress of their issues — █ done, ▓ in
+progress, ░ to do — and the % on the right is the share of done issues.
+    j / k     next / previous row (centred)
+    <Tab> za  unfold / fold the epic's issues    zR / zM  all
+    <CR> l    open issue          K     preview
+    > / <     move the bar a week later / earlier (both dates; a count
+              moves several weeks: 3>)
+    ] / [     move only its end a week later / earlier
+              Moves are saved once you stop pressing (0.8 s); a dim
+              (derived) bar gets real dates from what it showed
+    e         edit Start / Due in a popup (`YYYY-MM-DD`, empty clears)
+    H / L     scroll a page earlier / later   t   back to today
+    + / -     zoom in / out: days (3 columns a day), weeks (a column a
+              day), months (a column per 4 days). `=` works as `+`
+    d         toggle: also epics finished in the last 90 days
+    o y r     browser, copy key, refresh
+Fields: Jira's "Start date" (found by its English name in any UI
+language) and "Due date"; the epic colour as elsewhere.
+
+Editor (comments, issue text, new issue) ~
+A popup over the view (same keys as review.nvim's input). Empty: starts in
+insert mode; a reply starts in insert mode at the end.
+    <C-s>     submit (normal or insert mode; :w works too)
+    <CR>      submit (normal mode — in insert mode it is a newline)
+    <Esc> <C-c> q
+              close (normal mode; never asks)
+A comment, a reply, a comment edit and the description / issue text keep
+what you typed as a draft for the session when closed without submitting:
+opening the same popup again brings it back (title "(draft)"; a reply
+appends its quote to the comment draft). Submitting drops the draft; other
+popups (new issue, clone, dates, …) just drop the text.
+The popup closes when the server accepted the text and stays open with it
+when it did not. <C-s> may be eaten by terminal flow control (`stty -ixon`);
+<CR> always works.
+
+Issue and editor buffers have filetypes `tracker_issue` / `tracker_edit`
+and use the treesitter markdown parser. To have render-markdown.nvim draw
+them, add both to its `file_types` (and let its `ignore` accept these
+non-file buffers).
+
+Branch for an issue ~
+                                                                 *tracker-git*
+Everything below runs in the git root of Neovim's cwd, and nothing in it is
+fixed: commands, the remote, statuses and templates are `git` options with
+defaults, and `git.repos` changes any of them for one repository (a key
+without a slash is its directory name, one with a slash its path, as for
+|tracker-boards|): >lua
+
+    git = {
+      verify = { merge = { "git", "merge-branch" }, transition = { "In QA" } },
+      repos = {
+        firmware = { remote = "upstream", verify = { epic = { branch = "Production" } } },
+        ["~/work/web"] = { create = { "git", "switch", "-c", "{branch}" }, review = false },
+      },
+    },
+<
+Tables merge key by key; a list (a command) replaces the one it lands on.
+
+`gb` (issue view, list) first runs `git.fetch` (when `git.remote` exists)
+and looks for the issue's branch, locally and on the remote: any branch with
+its key (`feature/ABC-123-x` too; the `git.branch` name first, several → you
+pick). One that exists is checked out with `git.checkout` ("Switch to
+abc-123 (origin) in <repo> and pull?" — `git switch` makes a remote-only
+branch a tracking one) and, when it is on the remote, pulled with
+`git.pull`; then the follow-ups below run. When there is none, `gb` asks
+"Create branch abc-123 from <current branch> in <repo> (git switch)?" and
+runs `git.create` — by default `git switch -c {branch}`, so the new branch
+starts at what is checked out; a script can also push and open a merge
+request, e.g.: >lua
+
+    git = {
+      create = { "bash", "~/scripts/new-branch-mr.sh", "--non-interactive", "{branch}" },
+      transition = { "In Progress" },
+      mr_link = false,
+    },
+<
+The command runs in the background; a script that asks something (a
+milestone menu) needs `terminal = true`: it then runs in a floating
+terminal, which closes by itself when the command succeeded and stays open
+on a failure (`q` closes it).
+On Windows a `bash` or `sh` command runs Git for Windows' bash when
+Neovim's PATH has none (or only WSL's).
+The branch name comes from `git.branch` ({key_lower} → abc-123; {slug}
+is the summary in ascii-dashes, Polish letters included). Placeholders in
+`create`: {branch} {key} {summary} {milestone}. When the command succeeds:
+an unassigned issue is assigned to you (`assign_me`), a still-to-do issue
+takes the first of `transition` its workflow offers (a warning when none
+fits), and the first `…/merge_requests/N` (or `…/pull/N`) URL in the
+output becomes a web link "MR !N" (`mr_link`). A failing command shows its
+last lines. The event TrackerBranchCreated follows.
+
+review.nvim shows the issue of an MR's source branch in its Info panel
+("Issue": key, status, summary; `e` there opens it here) when this plugin
+is installed. The other way round, `gr` / `gc` call `git.review` /
+`git.cicd` = function(branch, issue) with the issue's branch (local or on
+the remote, after a fetch; the name without "<remote>/"). By default they
+open review.nvim (`require("review").open({ branch = … })`) and cicd.nvim's
+pipelines (`require("cicd").open_pipeline_browser({ branch = … })`); false
+turns a key off.
+
+Hand over for verification ~
+                                                              *tracker-verify*
+`gv` (issue view, list) finishes an issue: merges its branch, moves it to
+the verification status, unassigns it and drafts the comment testers read.
+It needs the merging command: >lua
+
+    git = {
+      verify = {
+        merge = { "git", "merge-branch" },   -- {branch} {key} {summary}
+        terminal = true,
+        transition = { "In Verification" },
+        template = [[
+    > [!INFO]
+    > **Done:**
+    > - {commits}
+
+    > [!SUCCESS]
+    > **Commit:** {commit} ({target})]],
+      },
+    },
+<
+`merge` ({branch} {key} {summary} {remote}) runs with the issue's branch
+checked out and has to leave the target branch (the one handed over, e.g.
+Develop) checked out — a script that pushes, switches, pulls and merges.
+Nothing is merged without it (`gv` on a task says so). Where `gv` starts:
+- on the issue's branch (any branch with its key): "Merge abc-123 (…) and
+  hand ABC-123 over for verification?". Uncommitted changes stop it first.
+- on a branch that already has the issue's branch merged — e.g. after the
+  command stopped on a conflict you resolved, committed and pushed: only
+  the hand-over, "abc-123 is already in Develop — hand ABC-123 over with
+  <hash>?" (warns when that branch isn't pushed). A branch without commits
+  of its own doesn't count as merged.
+- anywhere else: "On <branch>: switch to abc-123 and merge it …?" — checked
+  out (`git.checkout`, then `git.pull` when it is on the remote), merged.
+An issue already in a `transition` status (or done) asks before going on.
+
+Afterwards: the first of `transition` its workflow offers, unassigned
+(`unassign`), TrackerVerified, the view refreshed — and the comment editor
+opens with `template` filled in. <C-s> posts it; closed, it stays as the
+issue's comment draft (`c` brings it back).
+
+Template placeholders (a string, or function(ctx) → string; false = no
+draft): {key} {summary} {repo} {branch} {target} {hash} {short_hash}
+{commit} (`[short](commit URL)`, plain `short` without a web address)
+{commit_url} {web_url} {commits} {since}. The web address is `git.web_url`,
+else the remote's URL made https; `git.commit_url` builds the commit's URL
+from it — by default GitLab's `…/-/commit/<hash>` (GitHub's `…/commit/<hash>`
+on github.com), or a string "{web_url}/commits/{hash}". {hash} is the head of the target
+after the merge, so commits added by hand there count. {commits} lists the
+subjects (no merges) the merge brought in, newest first; a placeholder whose
+value has several lines repeats what precedes it on its line, so `> -
+{commits}` is a list inside a callout. Commits already handed over — hashes
+in the issue's comments this repository knows — are left out, and {since}
+is the latest of them (short). Callouts become Jira panels
+(|tracker-markdown|).
+
+An epic (hierarchy level 1) isn't merged: `gv` fetches and names the head of
+`epic.branch` on the remote (default: the remote's own default branch,
+<remote>/HEAD — main, Production, …), moves it with
+`epic.transition` and opens the description editor with `epic.template`
+added below the description (closed, a draft as well). The same
+placeholders, {branch} = {target} = `epic.branch`, {commits} empty.
+{changelogs} is empty for now: the releases since the last approved one
+need GitLab's / GitHub's API.
+
+==============================================================================
+7. Markdown and Jira text                                   *tracker-markdown*
+
+Jira Cloud stores descriptions and comments as ADF (Atlassian Document
+Format). The plugin converts ADF to Markdown for display and back on save.
+
+Round-trip safe: paragraphs, headings, bullet / ordered / task lists
+(`- [ ]`, `- [x]`), code blocks (incl. options such as line wrap), quotes,
+panels, rules, tables (layout, widths and cell colours are kept), links,
+bold / italic / code / strike, emoji, mentions, smart links, images and
+attachments, macros. Checked against ~350 real Jira Cloud descriptions and
+comments: all but a handful come back identical, the rest differ only in
+invisible whitespace.
+
+Syntax you will see (and can type):
+
+  > [!INFO]                       a Jira panel — INFO, NOTE, SUCCESS,
+  > text, lists, ```code``` …     WARNING, ERROR (a callout; render-markdown
+                                  draws it, see below). A plain `>` quote
+                                  stays a quote.
+  ```lua … ```                    a code block (language optional)
+  [@Name](mention:<accountId>)    a mention; a reply (`R`) inserts one for
+                                  the comment author so they get notified
+  ✅ 🙂                           an emoji, shown as the character —
+                                  Atlassian's own ones (:check_mark:,
+                                  :cross_mark:, …) as their nearest Unicode
+                                  look-alike; `:shortName:` works too.
+                                  A NEW emoji (typed, pasted or picked)
+                                  is saved as a Jira emoji, like Jira's
+                                  editor does; one the text had as a plain
+                                  character stays a character
+  <https://...>                   a smart link (inline card)
+  [attachment: shot.png](adf:1)   an image / attachment / macro kept as is:
+                                  leave the line to keep it, delete the
+                                  line to remove it (it can be moved)
+  a lone \ on a line              an empty line inside a paragraph
+  <br> / <p> in a table cell      line break / paragraph break
+
+Emoji in the editor popup work like in Jira's editor: `:` and two letters
+(":thu") suggest emoji by name — 👍 thumbsup, 👎 thumbsdown, Atlassian's
+own (:check_mark:, :cross_mark:, …) marked "(Atlassian)" — the ones you
+picked lately first. The pick goes in as the character (Atlassian's as
+`:name:`). Through nvim-cmp when it is installed (the source
+"tracker_emoji" joins the popup's sources, nowhere else), else <C-x><C-u>.
+Not after a letter or digit, so 10:30 stays 10:30. Names: GitHub's gemoji
+list (plus each emoji's Unicode name, e.g. thumbs_up).
+
+In the editor popup <C-/> (sent by most terminals as <C-_>) inserts an
+Info / Note / Success / Warning / Error panel or a code block (asks for the
+language) at the cursor; in visual mode it wraps the selected lines. Its
+last two entries add files:
+
+  ![image-20261017-120000.png](upload:C:/…/image-20261017-120000.png)
+  [attachment: report.pdf](upload:C:/…/report.pdf)
+
+<C-v> (or <C-/> → "Image from the clipboard") saves the clipboard's image
+as a PNG and puts the first kind of line at the cursor; "File(s)…" picks
+files with the chooser (an image gets `![…]`, anything else
+`[attachment: …]`). On submit the files are uploaded to the issue and the
+lines become what Jira's editor makes: the image inline, other files as a
+file card. Works in comments, edits and a new issue's description (the
+issue is created first, then the files go up). Text pastes as usual with p
+or the terminal's paste — <C-v> is only for images.
+
+Expands, status lozenges, dates, colours and underline are shown
+simplified. Editing text that contains them asks first: saving from
+Markdown drops them. (In a table cell, attachments are simplified too.)
+
+Comments are listed newest first.
+
+Rendering ~
+The issue view, the `K` preview and the editor are Markdown buffers
+(filetypes `tracker_issue`, `tracker_edit`). With render-markdown.nvim the
+panels show as coloured callouts, code as fenced blocks, headings, tables
+and lists styled — add both filetypes to its `file_types` and let its
+`ignore` accept them (they are scratch buffers): >lua
+
+    file_types = { "markdown", "tracker_issue", "tracker_edit" },
+    ignore = function(buf)
+      local ft = vim.bo[buf].filetype
+      if ft == "tracker_issue" or ft == "tracker_edit" then return false end
+      return vim.bo[buf].buftype ~= ""
+    end,
+<
+Jira's panel colours as callout highlights: `callout = { info = { highlight
+= ... }, note = ..., success = ..., warning = ..., error = ... }`. The
+tracker asks render-markdown to redraw after every refresh.
+
+==============================================================================
+8. Lua API                                                       *tracker-api*
+
+`require("tracker.api")` is the stable integration surface. Async calls
+take a callback `cb(result, err)` as the last positional argument, then an
+optional `opts` (`opts.provider` selects a tracker). Callbacks run on the
+main loop. Shapes: see lua/tracker/model.lua (TrackerIssue, TrackerComment,
+TrackerTransition, TrackerUser, TrackerBoard, TrackerSprint, TrackerColumn).
+
+Sync ~
+    providers()                    configured provider names
+    provider_info([opts])          { name, capabilities, project, base_url }
+    has(capability, [opts])        boolean
+    current_issue_key([opts])      key from the branch; opts.branch / cwd
+    web_url(key, [opts])
+    queries([opts])                saved queries, {project} expanded
+    resolve_query(query, [opts])   saved name → JQL (else as given)
+    recent_keys()                  keys seen this session
+
+Async ~
+    myself(cb)
+    search(query, cb, [opts])      opts.limit; meta = { truncated }
+    get_issue(key, cb)             includes description (Markdown)
+    get_comments(key, cb)
+    transitions(key, cb)
+    assignable_users(key, text, cb)
+    issue_types(project, cb)
+    boards(project, cb)
+    board(board_id, cb)            { columns, sprint, issues }
+    backlog(board_id, cb)
+
+Mutations (emit |tracker-events|) ~
+    transition(key, target, cb)    target = transition id / name / target
+                                   status name ("Done")
+    assign(key, user, cb)          user = id / user table / "me" / nil
+    comment(key, markdown, cb)
+    edit_comment(key, id, markdown, cb)
+    delete_comment(key, id, cb)
+    add_web_link(key, url, title, cb)   a web (remote) link
+    upload(key, paths, cb)         → TrackerAttachment[]
+    delete_attachment(key, id, cb)
+    link_types(cb)                 { id, name, inward, outward }
+    link(key, { type, direction, key = other }, cb)
+                                   read from `key`'s side: "outward" →
+                                   key blocks other, "inward" → key is
+                                   blocked by other
+    unlink(key, link_id, cb)       ids from issue.links
+    clone(key, { summary, link?, subtasks? }, cb)
+                                   → { key, url, subtasks, dropped,
+                                   failed } (see Clone)
+    update(key, { summary?, description? }, cb)
+    create({ project?, type?, type_id?, summary, description?, parent? }, cb)
+                                   `type` is a name ("Bug"); default "Task",
+                                   or a sub-task type when `parent` is set
+    rank(keys, { after | before = key }, cb)   re-rank (backlog order)
+    open_sprints(cb)               active + future sprints of `board`
+    move_to_sprint(sprint, keys, cb) / move_to_backlog(keys, cb)
+    archive(keys, cb)              Premium / Enterprise sites only
+    delete(key, with_subtasks, cb) for good
+
+Sprints (`board` from the provider config, `opts.board` overrides) ~
+    sprints(cb)                    every sprint: closed, active, future
+    sprint_issues(sprint, cb)      its issues in rank order
+    create_sprint(fields, cb)      fields = { name, goal?, start_date?,
+                                   end_date? } (ISO; false clears a date)
+    update_sprint(sprint, fields, cb)
+    start_sprint(sprint, fields, cb)   fields must carry both dates
+    complete_plan(sprint, cb)      what completing would do, no changes:
+                                   { done, open, target | new_name }
+    complete_sprint(plan, cb)      move `open` to `target` (creating
+                                   `new_name` if needed), close the sprint
+    next_sprint_name(sprints, project)   sync: "#60 X" → "#61"
+
+Timeline ~
+    timeline(cb, [opts])           { epics, children = { [epic key] =
+                                   issues } }; opts = { project?,
+                                   done_days? } (also epics done lately)
+    update(key, { start_date?, due_date? }, cb)
+                                   "YYYY-MM-DD", false clears
+Issues carry `start_date`, `due_date` ("YYYY-MM-DD"), `sprints`, `links`
+(TrackerLink: id, type, direction, label, issue) and `blocked`.
+
+Soft dependency from another plugin: >lua
+
+    local ok, tracker = pcall(require, "tracker.api")
+    if ok then
+      local key = tracker.current_issue_key()
+      if key then tracker.get_issue(key, function(issue) ... end) end
+    end
+<
+==============================================================================
+9. Events                                                     *tracker-events*
+
+`User` autocmds; `data` always has `provider` and `key`:
+
+    TrackerTransitioned     + transition, status
+    TrackerAssigned         + assignee (nil = unassigned)
+    TrackerCommentAdded     + comment
+    TrackerCommentEdited    + comment
+    TrackerCommentDeleted   + comment_id
+    TrackerLinked           + link ({ type, direction, key })
+    TrackerUnlinked         + link_id
+    TrackerBranchCreated    + branch, root (the repository), mr_url
+    TrackerVerified         + branch, target, hash (handed over), root
+    TrackerAttached         + attachments
+    TrackerAttachmentDeleted + attachment_id
+    TrackerIssueUpdated     + fields (names of the changed fields)
+    TrackerIssueCreated     + issue ({ id, key, url }); a clone also
+                            clone_of (+ parent for its sub-tasks)
+    TrackerStatusChanged    data = { cwd, entry } (|tracker-status|)
+    TrackerRanked           + keys, after | before
+    TrackerMoved            + keys, sprint (TrackerSprint) | backlog = true
+    TrackerArchived         + keys
+    TrackerDeleted          + with_subtasks
+
+Sprint events have `data.sprint` (TrackerSprint) instead of a key:
+
+    TrackerSprintCreated
+    TrackerSprintUpdated
+    TrackerSprintStarted
+    TrackerSprintCompleted  + moved (keys), target (TrackerSprint | nil)
+
+Example -- run a script when an issue is created: >lua
+
+    vim.api.nvim_create_autocmd("User", {
+      pattern = "TrackerIssueCreated",
+      callback = function(ev)
+        vim.system({ "bash", "create-branch.sh", ev.data.key })
+      end,
+    })
+<
+==============================================================================
+10. Status line                                               *tracker-status*
+
+`require("tracker.status")`:
+
+    enable()      start tracking (autocmds on DirChanged / FocusGained /
+                  BufEnter and tracker mutations); idempotent
+    current()     entry for the current directory's branch, or nil:
+                  { key, summary, status, url, error?, fetched_at }
+    refresh([force])
+
+`current()` is a table lookup -- safe on every redraw. Updates arrive as
+`User TrackerStatusChanged`, so a component can redraw on that event.
+
+==============================================================================
+11. Providers                                              *tracker-providers*
+
+A provider is a module implementing the interface documented at the top of
+lua/tracker/providers/init.lua, plus `name`, `defaults` and
+`capabilities`. The API refuses calls a provider has no capability for,
+and views hide nothing silently -- they report it.
+
+Out-of-tree provider: >lua
+
+    require("tracker.providers").register("youtrack", "my.youtrack.provider")
+    require("tracker").setup({ providers = { youtrack = { base_url = "..." } } })
+<
+==============================================================================
+12. Notifications                                             *tracker-notify*
+
+`notify.actions` -- confirmations ("ABC-1 → In Progress", "comment added").
+`notify.errors`  -- API / auth failures.
+`notify.enabled = false` silences both. `require("tracker.notify")
+.set_sink(fn)` reroutes messages (fn(msg, level)).
+
+==============================================================================
+13. Troubleshooting                                          *tracker-trouble*
+
+401 auth failed    wrong e-mail / token pair: Jira Cloud wants the account
+                   e-mail as login and an API token (not the password).
+403 forbidden      the account lacks the permission in that project.
+410 / 404 search   an old Jira Server URL; the provider targets Jira Cloud
+                   (/rest/api/3/search/jql).
+No board           set `providers.jira.board` to the board id from the
+                   board URL (.../boards/<id>).
+Slow / no answer   `debug = true` logs each request; `:checkhealth tracker`
+                   reports reachability.
+
+ vim:tw=78:ts=8:ft=help:norl:
